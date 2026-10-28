@@ -1,0 +1,184 @@
+pipeline {
+  agent any
+
+  environment {
+    GIT_URL                = 'https://github.com/minzee09/skala.git'
+    GIT_BRANCH             = 'main'
+    GIT_ID                 = 'sk141-github-id'
+    GIT_APP_DIR            = '26.10/28/skala-devops/01.spring-backend-v1.0'
+    IMAGE_NAME             = 'sk141-webserver'
+    IMAGE_REGISTRY_URL     = 'skala-registry.skala-ai.com'
+    IMAGE_REGISTRY_PROJECT = 'class-5'
+    DOCKER_CREDENTIAL_ID   = 'skala-image-registry-id'
+    KUBECONFIG_ID          = 'sk141-kubeconfig'
+    K8S_NAMESPACE          = 'class-5'
+    DEPLOYMENT_NAME        = 'sk141-myfirst-api-server'
+    K8S_SERVICE_NAME       = 'sk141-myfirst-api-server'
+    CONFIGMAP_NAME         = 'sk141-backend-configmap'
+    CONTAINER_NAME         = 'myfirst-api-server'
+  }
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+    timestamps()
+    timeout(time: 20, unit: 'MINUTES')
+  }
+
+  stages {
+    stage('Clone Repository') {
+      steps {
+        deleteDir()
+        git branch: env.GIT_BRANCH, url: env.GIT_URL, credentialsId: env.GIT_ID
+        script {
+          def jobName = (env.JOB_BASE_NAME ?: 'job').toLowerCase().replaceAll('[^a-z0-9_.-]', '-')
+          env.IMAGE_TAG = '1.0-' + jobName.take(80) + '-' + env.BUILD_NUMBER
+          env.IMAGE_REF = env.IMAGE_REGISTRY_URL + '/' + env.IMAGE_REGISTRY_PROJECT + '/' + env.IMAGE_NAME + ':' + env.IMAGE_TAG
+        }
+        dir(env.GIT_APP_DIR) {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+test -f pom.xml
+test -f repo-setting/settings.xml
+test -f Dockerfile
+test -d kustomize/overlays/dev
+'''
+        }
+      }
+    }
+
+    stage('Build with Maven') {
+      steps {
+        dir(env.GIT_APP_DIR) {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+mvn -B -s repo-setting/settings.xml clean package -DskipTests
+test -n "$(find target -maxdepth 1 -name "*.jar" -print -quit)"
+'''
+        }
+      }
+    }
+
+    stage('Image Build & Push (BuildKit)') {
+      steps {
+        dir(env.GIT_APP_DIR) {
+          withCredentials([usernamePassword(
+            credentialsId: env.DOCKER_CREDENTIAL_ID,
+            usernameVariable: 'REG_USER',
+            passwordVariable: 'REG_PASS'
+          )]) {
+            sh '''#!/usr/bin/env bash
+set +x
+set -euo pipefail
+umask 077
+# Keep registry auth outside the app directory sent as the build context.
+DOCKER_CONFIG="$(mktemp -d "$WORKSPACE/.docker-auth.XXXXXX")"
+export DOCKER_CONFIG
+trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+printf '%s' "$REG_PASS" | docker login -u "$REG_USER" --password-stdin "$IMAGE_REGISTRY_URL"
+docker buildx build --platform linux/amd64 -t "$IMAGE_REF" --push .
+'''
+          }
+        }
+      }
+    }
+
+    stage('Update K8s Manifests') {
+      steps {
+        dir(env.GIT_APP_DIR) {
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+IMAGE_BASE="$IMAGE_REGISTRY_URL/$IMAGE_REGISTRY_PROJECT/$IMAGE_NAME"
+(
+  cd kustomize/overlays/dev
+  kustomize edit set image "$IMAGE_BASE=$IMAGE_REF"
+)
+kustomize build kustomize/overlays/dev > ci-rendered-dev.yaml
+'''
+        }
+      }
+    }
+
+    stage('Deploy to Kubernetes') {
+      steps {
+        withCredentials([file(credentialsId: env.KUBECONFIG_ID, variable: 'KUBECONFIG')]) {
+          dir(env.GIT_APP_DIR) {
+            sh '''#!/usr/bin/env bash
+set +x
+set -euo pipefail
+test "$(kubectl config view --minify -o 'jsonpath={.contexts[0].context.namespace}')" = "$K8S_NAMESPACE"
+
+# Convert without creating resources, then reject anything outside this app.
+kubectl create --dry-run=client --validate=false -n "$K8S_NAMESPACE" -f ci-rendered-dev.yaml -o json > ci-rendered-dev.json
+python3 - <<'PY'
+import json
+import os
+
+with open('ci-rendered-dev.json') as source:
+    rendered = source.read()
+# kubectl can emit one JSON object per YAML document rather than a List.
+decoder = json.JSONDecoder()
+items = []
+position = 0
+while position < len(rendered):
+    while position < len(rendered) and rendered[position].isspace():
+        position += 1
+    if position == len(rendered):
+        break
+    document, position = decoder.raw_decode(rendered, position)
+    if not isinstance(document, dict):
+        raise SystemExit('Refusing deployment: invalid resource JSON.')
+    resources = document.get('items', []) if document.get('kind') == 'List' else [document]
+    if not isinstance(resources, list) or not all(isinstance(item, dict) for item in resources):
+        raise SystemExit('Refusing deployment: invalid resource List.')
+    items.extend(resources)
+namespace = os.environ['K8S_NAMESPACE']
+expected = {
+    ('apps/v1', 'Deployment', namespace, os.environ['DEPLOYMENT_NAME']),
+    ('v1', 'Service', namespace, os.environ['K8S_SERVICE_NAME']),
+    ('v1', 'ConfigMap', namespace, os.environ['CONFIGMAP_NAME']),
+}
+actual = {
+    (item.get('apiVersion'), item.get('kind'), item.get('metadata', {}).get('namespace'), item.get('metadata', {}).get('name'))
+    for item in items
+}
+if len(items) != len(expected) or actual != expected:
+    raise SystemExit('Refusing deployment: rendered resources differ from the app allowlist.')
+deployment = next(item for item in items if item['kind'] == 'Deployment')
+containers = deployment['spec']['template']['spec']['containers']
+if len(containers) != 1 or containers[0].get('name') != os.environ['CONTAINER_NAME'] or containers[0].get('image') != os.environ['IMAGE_REF']:
+    raise SystemExit('Refusing deployment: app container or image does not match this build.')
+print('Validated app resource allowlist in namespace ' + namespace)
+PY
+
+kubectl apply -n "$K8S_NAMESPACE" -f ci-rendered-dev.yaml
+kubectl rollout status deployment/"$DEPLOYMENT_NAME" -n "$K8S_NAMESPACE" --timeout=300s
+
+# Verify the Deployment references this job's unique image after rollout.
+kubectl get deployment "$DEPLOYMENT_NAME" -n "$K8S_NAMESPACE" -o json > ci-deployed.json
+python3 - <<'PY'
+import json
+import os
+
+with open('ci-deployed.json') as source:
+    deployment = json.load(source)
+containers = deployment['spec']['template']['spec']['containers']
+images = [item.get('image') for item in containers if item.get('name') == os.environ['CONTAINER_NAME']]
+if images != [os.environ['IMAGE_REF']]:
+    raise SystemExit('Deployment image does not match the image built by this job.')
+print('Verified deployed image: ' + images[0])
+PY
+kubectl get pods -n "$K8S_NAMESPACE" -l "app=$DEPLOYMENT_NAME"
+'''
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      deleteDir()
+    }
+  }
+}
